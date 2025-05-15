@@ -101,6 +101,26 @@ You can also run individual components of the pipeline:
 - **Texture Mapping**: Project image colors onto the 3D mesh
 - **OBJ Export**: Generate the final textured 3D model
 
+## Visualization Examples
+
+Below are some visualization results from the pipeline:
+
+**Mesh Projection Overlay**
+
+![Mesh Projection Overlay](data/mesh_projection_overlay.png)
+
+**MediaPipe Landmarks Overlay**
+
+![MediaPipe Landmarks Overlay](data/mediapipe_landmarks_overlay.png)
+
+**UV Overlay**
+
+![UV Overlay](data/uv_overlay.png)
+
+**UV Scatter**
+
+![UV Scatter](data/uv_scatter.png)
+
 ## License
 
 This project is built independently. However, note that the FLAME model has its own license that must be followed when using this pipeline. 
