@@ -82,4 +82,7 @@ htmlcov/
 .nox/
 .coverage.*
 coverage.xml
-*.cover 
+*.cover
+
+# Ignore large texture file
+/data/additional_resources/TextureSpace.zip 
