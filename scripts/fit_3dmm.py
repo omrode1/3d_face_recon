@@ -71,16 +71,22 @@ class FaceFitter:
         # Pose parameters (global rotation and jaw)
         pose_params = torch.zeros(1, self.flame.n_pose_params, device=self.device)
         
-        # Camera parameters (scale, rotation, translation)
-        cam_params = torch.tensor([[5.0, 0.0, 0.0, 0.0]], device=self.device, requires_grad=True)
+        # Initialize camera parameters
+        scale = torch.tensor(4.0, requires_grad=True, device=self.device)
+        tx = torch.tensor(0.0, requires_grad=True, device=self.device)
+        ty = torch.tensor(0.0, requires_grad=True, device=self.device)
+        tz = torch.tensor(0.0, requires_grad=True, device=self.device)
         
         # Make parameters require gradients
         shape_params.requires_grad = True
         exp_params.requires_grad = True
         pose_params.requires_grad = True
-        cam_params.requires_grad = True
+        scale.requires_grad = True
+        tx.requires_grad = True
+        ty.requires_grad = True
+        tz.requires_grad = True
         
-        return shape_params, exp_params, pose_params, cam_params
+        return shape_params, exp_params, pose_params, scale, tx, ty, tz
         
     def project_vertices(self, vertices, cam_params, image_size):
         """Project 3D vertices to 2D using weak perspective projection"""
@@ -178,20 +184,28 @@ class FaceFitter:
         # Prepare landmarks
         landmarks = np.array(landmarks)
         
+        # Load MediaPipe-to-FLAME mapping
+        mapping_path = 'data/additional_resources/mediapipe_landmark_embedding.npz'
+        mapping_data = np.load(mapping_path, allow_pickle=True)
+        flame_lmk_indices = mapping_data['landmark_indices'][:68]
+        
         # Choose the appropriate fitting method based on single_view flag
         if self.single_view:
             return self.fit_face_single_view(image_path, landmarks, iterations)
         else:
             # Original multi-view method
             # Initialize parameters
-            shape_params, exp_params, pose_params, cam_params = self.initialize_params()
+            shape_params, exp_params, pose_params, scale, tx, ty, tz = self.initialize_params()
             
             # Optimizer
             optimizer = torch.optim.Adam([
                 {'params': shape_params},
                 {'params': exp_params},
                 {'params': pose_params},
-                {'params': cam_params, 'lr': 0.05}  # Higher LR for camera
+                {'params': scale, 'lr': 0.05},
+                {'params': tx, 'lr': 0.05},
+                {'params': ty, 'lr': 0.05},
+                {'params': tz}
             ], lr=0.005)
             
             # Landmark loss weighting
@@ -210,14 +224,14 @@ class FaceFitter:
                 # Forward pass
                 vertices, _ = self.flame(shape_params, exp_params, pose_params)
                 
-                # Get model landmarks
-                model_landmarks = vertices[:, self.flame.landmark_indices, :]
+                # Get model landmarks using mapped indices
+                model_landmarks = vertices[:, flame_lmk_indices, :]
                 
                 # Scale model landmarks to image
                 model_landmarks_2d = model_landmarks[:, :, :2]
-                model_landmarks_2d = model_landmarks_2d * cam_params[:, 0:1].unsqueeze(1)
-                translation = cam_params[:, 1:3].unsqueeze(1)
-                model_landmarks_2d = model_landmarks_2d + translation
+                model_landmarks_2d = model_landmarks_2d * scale.view(-1, 1, 1)
+                translation = torch.stack([tx, ty, tz]).view(1, 1, 3)
+                model_landmarks_2d = model_landmarks_2d + translation[:, :, :2]
 
                 # Convert to image space (keep as tensor)
                 model_landmarks_2d = model_landmarks_2d.squeeze(0)
@@ -258,21 +272,24 @@ class FaceFitter:
                 
                 # Backward and optimize
                 total_loss.backward()
-                print(f"cam_params.grad: {cam_params.grad}")
+                print(f"scale.grad: {scale.grad}, tx.grad: {tx.grad}, ty.grad: {ty.grad}, tz.grad: {tz.grad}")
                 optimizer.step()
                 
                 # Print progress
                 if (i+1) % 10 == 0:
                     print(f"Iteration {i+1}/{iterations}, Loss: {total_loss.item():.4f}")
             
-            print(f"Optimized camera parameters: {cam_params.detach().cpu().numpy()}")
+            print(f"Optimized camera parameters: {scale.detach().cpu().numpy()}, {tx.detach().cpu().numpy()}, {ty.detach().cpu().numpy()}, {tz.detach().cpu().numpy()}")
             
             # Return optimized parameters
             params = {
                 'shape_params': shape_params.detach().cpu().numpy().tolist(),
                 'exp_params': exp_params.detach().cpu().numpy().tolist(),
                 'pose_params': pose_params.detach().cpu().numpy().tolist(),
-                'cam_params': cam_params.detach().cpu().numpy().tolist()
+                'scale': scale.detach().cpu().numpy().tolist(),
+                'tx': tx.detach().cpu().numpy().tolist(),
+                'ty': ty.detach().cpu().numpy().tolist(),
+                'tz': tz.detach().cpu().numpy().tolist()
             }
             
             return params
@@ -309,14 +326,17 @@ class FaceFitter:
             landmarks = landmarks.unsqueeze(0)
         
         # Initialize parameters with stronger priors for single view
-        shape_params, exp_params, pose_params, cam_params = self.initialize_params()
+        shape_params, exp_params, pose_params, scale, tx, ty, tz = self.initialize_params()
         
         # Optimizer with different learning rates for different parameter groups
         optimizer = torch.optim.Adam([
             {'params': shape_params, 'lr': 0.001},  # Lower lr for shape
             {'params': exp_params, 'lr': 0.01},     # Higher lr for expressions
             {'params': pose_params, 'lr': 0.005},   # Medium lr for pose
-            {'params': cam_params, 'lr': 0.01}      # Higher lr for camera
+            {'params': scale, 'lr': 0.01},           # Higher lr for scale
+            {'params': tx, 'lr': 1.0},              # Higher lr for translation (pixel units)
+            {'params': ty, 'lr': 1.0},              # Higher lr for translation (pixel units)
+            {'params': tz, 'lr': 0.01}               # Higher lr for translation
         ])
         
         # Landmark loss weighting (focusing more on contour for single-view)
@@ -345,22 +365,24 @@ class FaceFitter:
             # Forward pass
             vertices, _ = self.flame(shape_params, exp_params, pose_params)
             
-            # Get model landmarks
-            model_landmarks = vertices[:, self.flame.landmark_indices, :]
+            # Get model landmarks using mapped indices
+            model_landmarks = vertices[:, flame_lmk_indices, :]
+            
+            # Center the mesh landmarks
+            center = model_landmarks.mean(dim=1, keepdim=True)
+            model_landmarks_centered = model_landmarks - center
             
             # Project to 2D space
-            # Scale model landmarks to image
-            model_landmarks_2d = model_landmarks[:, :, :2]
-            
+            model_landmarks_2d = model_landmarks_centered[:, :, :2]
             # Apply scale
-            model_landmarks_2d = model_landmarks_2d * cam_params[:, 0:1].unsqueeze(1)
-            
+            model_landmarks_2d = model_landmarks_2d * scale.view(-1, 1, 1)
             # Convert to image space
             model_landmarks_2d[:, :, 0] = model_landmarks_2d[:, :, 0] * image_width + image_width/2
             model_landmarks_2d[:, :, 1] = model_landmarks_2d[:, :, 1] * image_height + image_height/2
+            # Apply translation (tx, ty) in pixel units
+            model_landmarks_2d = model_landmarks_2d + torch.stack([tx, ty], dim=1).view(-1, 1, 2)
             
             # Compute landmark loss
-            # Make sure landmarks and model_landmarks_2d have the same shape
             min_landmarks = min(model_landmarks_2d.shape[1], landmarks.shape[1])
             loss = torch.nn.functional.mse_loss(
                 model_landmarks_2d[:, :min_landmarks, :],
@@ -378,11 +400,9 @@ class FaceFitter:
             pose_reg = torch.mean(pose_params ** 2) * 0.1  # Higher weight for pose regularization
             
             # Symmetry constraint (optional - enforces some face symmetry)
-            # In single-view scenarios, symmetry helps with unseen parts
-            # Only apply to shape parameters (not expressions which can be asymmetric)
             if shape_params.shape[1] >= 2:
                 even_indices = torch.arange(0, shape_params.shape[1], 2, device=self.device)
-                if even_indices.shape[0] > 1:  # Need at least two even indices
+                if even_indices.shape[0] > 1:
                     symmetry_loss = torch.mean(torch.abs(shape_params[:, even_indices[:-1]] - shape_params[:, even_indices[1:]]))
                 else:
                     symmetry_loss = torch.tensor(0.0, device=self.device)
@@ -412,16 +432,22 @@ class FaceFitter:
             # Forward pass
             vertices, _ = self.flame(shape_params, exp_params, pose_params)
             
-            # Get model landmarks
-            model_landmarks = vertices[:, self.flame.landmark_indices, :]
+            # Get model landmarks using mapped indices
+            model_landmarks = vertices[:, flame_lmk_indices, :]
+            
+            # Center the mesh landmarks
+            center = model_landmarks.mean(dim=1, keepdim=True)
+            model_landmarks_centered = model_landmarks - center
             
             # Project to 2D space
-            model_landmarks_2d = model_landmarks[:, :, :2]
-            model_landmarks_2d = model_landmarks_2d * cam_params[:, 0:1].unsqueeze(1)
-            
+            model_landmarks_2d = model_landmarks_centered[:, :, :2]
+            # Apply scale
+            model_landmarks_2d = model_landmarks_2d * scale.view(-1, 1, 1)
             # Convert to image space
             model_landmarks_2d[:, :, 0] = model_landmarks_2d[:, :, 0] * image_width + image_width/2
             model_landmarks_2d[:, :, 1] = model_landmarks_2d[:, :, 1] * image_height + image_height/2
+            # Apply translation (tx, ty) in pixel units
+            model_landmarks_2d = model_landmarks_2d + torch.stack([tx, ty], dim=1).view(-1, 1, 2)
             
             # Compute landmark loss - same as stage 1
             min_landmarks = min(model_landmarks_2d.shape[1], landmarks.shape[1])
@@ -456,7 +482,10 @@ class FaceFitter:
             'shape_params': shape_params.detach().cpu().numpy().tolist(),
             'exp_params': exp_params.detach().cpu().numpy().tolist(),
             'pose_params': pose_params.detach().cpu().numpy().tolist(),
-            'cam_params': cam_params.detach().cpu().numpy().tolist()
+            'scale': scale.detach().cpu().numpy().tolist(),
+            'tx': tx.detach().cpu().numpy().tolist(),
+            'ty': ty.detach().cpu().numpy().tolist(),
+            'tz': tz.detach().cpu().numpy().tolist()
         }
         
         return params

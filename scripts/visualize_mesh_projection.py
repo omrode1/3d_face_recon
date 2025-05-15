@@ -20,6 +20,9 @@ flame = FlameModel(model_path, flame_version='2023')
 # Load parameters
 with open(param_path, 'r') as f:
     params = json.load(f)
+scale = float(params['scale'])
+tx = float(params['tx'])
+ty = float(params['ty'])
 
 # Apply numpy compatibility patches
 if not hasattr(np, 'bool'):
@@ -41,7 +44,6 @@ if not hasattr(np, 'unicode'):
 shape_params = torch.tensor(params['shape_params'][0], dtype=torch.float32).unsqueeze(0)
 exp_params = torch.tensor(params['exp_params'][0], dtype=torch.float32).unsqueeze(0)
 pose_params = torch.tensor(params['pose_params'][0], dtype=torch.float32).unsqueeze(0)
-cam_params = np.array(params['cam_params'][0], dtype=np.float32)
 
 # Get mesh vertices
 vertices, _ = flame(shape_params, exp_params, pose_params)
@@ -53,18 +55,39 @@ image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 h, w = image.shape[:2]
 
 # Project 3D vertices to 2D using camera parameters (match fitting logic)
-projected = vertices[:, :2] * cam_params[0]
-projected += np.array([cam_params[1], cam_params[2]])  # translation is in normalized space
+projected = vertices[:, :2] * scale
+projected += np.array([tx, ty])  # translation is in normalized space
 projected[:, 0] = projected[:, 0] * w + w / 2
 projected[:, 1] = projected[:, 1] * h + h / 2
 
 print(f"Projected 2D range: min={projected.min(axis=0)}, max={projected.max(axis=0)}, mean={projected.mean(axis=0)}")
 
-# Overlay projected points on image
+# Load MediaPipe-to-FLAME mapping
+mapping_path = 'data/additional_resources/mediapipe_landmark_embedding.npz'
+mapping_data = np.load(mapping_path, allow_pickle=True)
+flame_lmk_indices = mapping_data['landmark_indices'][:68]
+
+# Get model landmarks (indices used in fitting)
+model_landmarks_2d = projected[flame_lmk_indices]
+
+# Overlay only the FLAME mesh landmarks (red) and 2D detected landmarks (green)
 overlay = image_rgb.copy()
-for x, y in projected.astype(int):
+for x, y in model_landmarks_2d.astype(int):
     if 0 <= x < w and 0 <= y < h:
-        cv2.circle(overlay, (x, y), 1, (0, 0, 255), -1)
+        cv2.circle(overlay, (x, y), 2, (255, 0, 0), -1)  # Red for mesh landmarks
+
+# Overlay 2D detected landmarks (green)
+landmark_path = 'data/processed/Front_landmarks.json'  # Update if needed
+try:
+    with open(landmark_path, 'r') as f:
+        landmarks = json.load(f)
+    landmarks = np.array(landmarks)
+    for x, y in landmarks.astype(int):
+        cv2.circle(overlay, (x, y), 2, (0, 255, 0), -1)  # Green for detected landmarks
+    print("\nFLAME mesh landmark coordinates (projected):\n", model_landmarks_2d)
+    print("\n2D detected landmark coordinates:\n", landmarks)
+except Exception as e:
+    print(f"Could not overlay 2D landmarks: {e}")
 
 plt.figure(figsize=(8, 8))
 plt.imshow(overlay)
